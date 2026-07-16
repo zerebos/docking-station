@@ -57,6 +57,7 @@ def cached(expire: Optional[int] = None,
            coder: Optional[Type[Coder]] = None,
            key_builder: Optional[Callable[..., Any]] = None,
            namespace: Optional[str] = '',
+           cache_none: bool = True,
            return_type: Optional[type[BaseModel]] = None) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
 
     def wrapper(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
@@ -184,7 +185,7 @@ def cached(expire: Optional[int] = None,
                     or not FastAPICache.get_enable()
             ):
                 ret = await ensure_async_func(*args, **kwargs)
-                if not no_store:
+                if not no_store and (cache_none or ret is not None):
                     await backend.set(cache_key, coder.encode(ret), expire)
                 return ret
 
@@ -203,12 +204,13 @@ def cached(expire: Optional[int] = None,
                     return ret
 
                 ret = await ensure_async_func(*args, **kwargs)
-                try:
-                    await backend.set(cache_key, coder.encode(ret), expire)
-                except Exception:
-                    logger.warning(
-                        f"Error setting cache key '{cache_key}' in backend:", exc_info=True
-                    )
+                if cache_none or ret is not None:
+                    try:
+                        await backend.set(cache_key, coder.encode(ret), expire)
+                    except Exception:
+                        logger.warning(
+                            f"Error setting cache key '{cache_key}' in backend:", exc_info=True
+                        )
                 return ret
 
             if request.method != "GET":
@@ -231,10 +233,11 @@ def cached(expire: Optional[int] = None,
             ret = await ensure_async_func(*args, **kwargs)
             encoded_ret = coder.encode(ret)
 
-            try:
-                await backend.set(cache_key, encoded_ret, expire)
-            except Exception:
-                logger.warning(f"Error setting cache key '{cache_key}' in backend:", exc_info=True)
+            if cache_none or ret is not None:
+                try:
+                    await backend.set(cache_key, encoded_ret, expire)
+                except Exception:
+                    logger.warning(f"Error setting cache key '{cache_key}' in backend:", exc_info=True)
 
             # response.headers["Cache-Control"] = f"max-age={expire}"
             etag = f"W/{hash(encoded_ret)}"
