@@ -4,6 +4,8 @@ import subprocess
 from datetime import timedelta
 from logging import getLogger
 
+from fastapi_cache import FastAPICache
+
 from ..schemas import RegctlImageInspect
 from ..settings import cached, get_app_settings
 
@@ -41,6 +43,20 @@ _RETRYABLE_ERROR_SIGNATURES = (
     'eof',
 )
 
+# Substrings that mark an error as a definitive "this image has no remote"
+# result (e.g. local-only images). These are safe to negative-cache briefly so
+# we don't re-run regctl for them on every dashboard load.
+_NOT_FOUND_ERROR_SIGNATURES = (
+    'manifest unknown',
+    'no such manifest',
+    'no such repository',
+    'repository name not known',
+    'repository does not exist',
+    'name unknown',
+    'not found',
+    'notfound',
+)
+
 # Global limiter shared by every registry-bound regctl invocation. Without this,
 # rendering the dashboard fires one subprocess per image (digest + inspect)
 # concurrently, which bursts straight into Docker Hub's rate limit.
@@ -53,16 +69,51 @@ class RegctlError(Exception):
     """Raised when a regctl command fails after exhausting retries."""
 
 
+class RegctlNotFoundError(RegctlError):
+    """Raised when regctl reports the image definitively has no remote."""
+
+
 def _is_retryable_error(message: str) -> bool:
     msg = (message or '').lower()
     return any(signature in msg for signature in _RETRYABLE_ERROR_SIGNATURES)
+
+
+def _is_not_found_error(message: str) -> bool:
+    msg = (message or '').lower()
+    return any(signature in msg for signature in _NOT_FOUND_ERROR_SIGNATURES)
+
+
+async def _negative_cache_has(repo_tag: str) -> bool:
+    """Return True if repo_tag was recently seen as definitively not-found."""
+    if app_settings.server.registry_negative_cache_seconds <= 0:
+        return False
+    try:
+        backend = FastAPICache.get_backend()
+        _ttl, data = await backend.get_with_ttl(f'regctl:not-found:{repo_tag}')
+        return data is not None
+    except Exception:
+        logger.warning('Error reading regctl negative cache for %s', repo_tag, exc_info=True)
+        return False
+
+
+async def _negative_cache_add(repo_tag: str) -> None:
+    """Remember, for a short TTL, that repo_tag has no remote."""
+    ttl = int(app_settings.server.registry_negative_cache_seconds)
+    if ttl <= 0:
+        return
+    try:
+        backend = FastAPICache.get_backend()
+        await backend.set(f'regctl:not-found:{repo_tag}', '1', ttl)
+    except Exception:
+        logger.warning('Error writing regctl negative cache for %s', repo_tag, exc_info=True)
 
 
 async def _run_regctl(cmd: str) -> bytes:
     """Run a regctl command under the global concurrency limiter, retrying
     rate-limit/transient failures with exponential backoff and jitter.
 
-    Returns the command's stdout on success, raises RegctlError otherwise.
+    Returns the command's stdout on success. Raises RegctlNotFoundError for a
+    definitive not-found result, or RegctlError otherwise.
     """
     max_retries = max(0, app_settings.server.registry_max_retries)
     base_backoff = app_settings.server.registry_retry_backoff_seconds
@@ -96,6 +147,8 @@ async def _run_regctl(cmd: str) -> bytes:
 
         break
 
+    if _is_not_found_error(last_error) and not _is_retryable_error(last_error):
+        raise RegctlNotFoundError(last_error or 'not found')
     raise RegctlError(last_error or 'unknown error')
 
 
@@ -114,6 +167,10 @@ async def get_image_remote_digest(repo_tag: str, reraise: bool = False, no_cache
             else:
                 image_name, _tag = repo_tag, ''
 
+            if not no_cache and await _negative_cache_has(repo_tag):
+                logger.debug('regctl image digest skipped (negative cache): %s', repo_tag)
+                return None
+
             cmd = f'regctl image digest "{repo_tag}"'
             logger.debug('regctl image digest request: %s', repo_tag)
             stdout = await _run_regctl(cmd)
@@ -122,6 +179,13 @@ async def get_image_remote_digest(repo_tag: str, reraise: bool = False, no_cache
             res = f'{image_name}@{digest}'
             logger.info('regctl image digest response: %s', res)
             return res
+
+        except RegctlNotFoundError as e:
+            logger.info('regctl image digest not found (negative-cached): %s (%s)', repo_tag, e)
+            await _negative_cache_add(repo_tag)
+            if reraise:
+                raise Exception(f'Error running regctl command: {e}')
+            return None
 
         except Exception as e:
             logger.error('Error running regctl command: %s', e)
@@ -146,6 +210,10 @@ async def get_image_inspect(repo_tag: str, reraise: bool = False, no_cache: bool
         nonlocal reraise
 
         try:
+            if not no_cache and await _negative_cache_has(repo_tag):
+                logger.debug('regctl image inspect skipped (negative cache): %s', repo_tag)
+                return None
+
             cmd = f'regctl image inspect "{repo_tag}"'
             logger.debug('regctl image inspect request: %s', repo_tag)
             stdout = await _run_regctl(cmd)
@@ -153,6 +221,13 @@ async def get_image_inspect(repo_tag: str, reraise: bool = False, no_cache: bool
             res = RegctlImageInspect.model_validate_json(stdout)
             logger.info('regctl image inspect response: %s', res.created)
             return res
+
+        except RegctlNotFoundError as e:
+            logger.info('regctl image inspect not found (negative-cached): %s (%s)', repo_tag, e)
+            await _negative_cache_add(repo_tag)
+            if reraise:
+                raise Exception(f'Error running regctl command: {e}')
+            return None
 
         except Exception as e:
             logger.error('Error running regctl command: %s', e)

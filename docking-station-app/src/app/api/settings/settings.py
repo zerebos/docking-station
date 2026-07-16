@@ -56,12 +56,17 @@ class ServerSettings(BaseSettings, CamelCaseAliasedBaseModel):
                                                                                          'docker.io/library/'])
     registry_max_concurrency: int = 4
     registry_max_retries: int = 4
+    registry_negative_cache: Interval = '1h'
     registry_retry_backoff: Interval = '2s'
     time_until_update_is_mature: Interval = '1w'
 
     @property
     def cache_control_max_age_seconds(self):
         return self.cache_control_max_age.total_seconds()
+
+    @property
+    def registry_negative_cache_seconds(self):
+        return self.registry_negative_cache.total_seconds()
 
     @property
     def registry_retry_backoff_seconds(self):

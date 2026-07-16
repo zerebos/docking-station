@@ -27,6 +27,10 @@ Check [settings.template.yml](./settings.template.yml) for a list of all availab
 - registry_max_retries
   - How many times to retry a rate-limited or transient registry error before giving up
   - Retries use exponential backoff with jitter (default `4`)
+- registry_negative_cache
+  - How long to remember that an image has no remote (e.g. local-only images)
+  - Avoids re-querying definitively-missing images on every refresh
+  - Accepts human readable suffixes (e.g. `1h`, `1d`); set `0` to disable (default `1h`)
 - registry_retry_backoff
   - Base delay for the exponential backoff between retries
   - Accepts human readable suffixes (e.g. `2s`, `1m`) (default `2s`)
