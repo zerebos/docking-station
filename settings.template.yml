@@ -15,6 +15,9 @@ server:
   python_on_whales__ignored_image_prefixes:
     - docker.io/library/
     - docker.io/
+  registry_max_concurrency: 4  # max concurrent regctl queries to the registry
+  registry_max_retries: 4  # retries for rate-limited/transient registry errors
+  registry_retry_backoff: 2s  # base delay for exponential backoff between retries
   time_until_update_is_mature: 1w
 
 auto_updater:

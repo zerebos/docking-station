@@ -21,6 +21,15 @@ Check [settings.template.yml](./settings.template.yml) for a list of all availab
   - List of labels with possible links to image's homepage
 - possible_image_version_labels (Order matters!)
   - List of labels with possible value for image's version
+- registry_max_concurrency
+  - Maximum number of concurrent registry queries (`regctl`) allowed at once
+  - Lower this if you keep hitting Dockerhub's rate limit (default `4`)
+- registry_max_retries
+  - How many times to retry a rate-limited or transient registry error before giving up
+  - Retries use exponential backoff with jitter (default `4`)
+- registry_retry_backoff
+  - Base delay for the exponential backoff between retries
+  - Accepts human readable suffixes (e.g. `2s`, `1m`) (default `2s`)
 - time_until_update_is_mature
   - Time in seconds until an update is considered mature
   - Accepts human readable suffixes (e.g. `1h`, `1d`, `1w`)
@@ -41,7 +50,12 @@ Moreover, Docking Station [tries to discover](./docking-station-app/src/app/api/
 ### Dockerhub API Rate Limit
 
 Dockerhub has a [rate limit](https://docs.docker.com/docker-hub/download-rate-limit/) on how much you can query their API.  
-To work around this, Docking Station caches the results of the API calls and only queries Dockerhub when the cache expires.
+To work around this, Docking Station:
+
+- caches the results of the API calls and only queries Dockerhub when the cache expires,
+- limits how many registry queries run concurrently (`registry_max_concurrency`) so it doesn't burst past the rate limit,
+- retries rate-limited/transient errors with exponential backoff (`registry_max_retries`, `registry_retry_backoff`), and
+- never caches a failed lookup, so a transient rate-limit hit doesn't hide update info until the cache expires.
 
 You are able to force a refresh of the cache by clicking the refresh button on the service's page.
 
