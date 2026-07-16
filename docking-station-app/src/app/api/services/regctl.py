@@ -59,10 +59,18 @@ _NOT_FOUND_ERROR_SIGNATURES = (
 
 # Global limiter shared by every registry-bound regctl invocation. Without this,
 # rendering the dashboard fires one subprocess per image (digest + inspect)
-# concurrently, which bursts straight into Docker Hub's rate limit.
-_registry_semaphore = asyncio.Semaphore(
-    max(1, app_settings.server.registry_max_concurrency)
-)
+# concurrently, which bursts straight into Docker Hub's rate limit. Created
+# lazily so it binds to the running event loop rather than import-time state.
+_registry_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_registry_semaphore() -> asyncio.Semaphore:
+    global _registry_semaphore
+    if _registry_semaphore is None:
+        _registry_semaphore = asyncio.Semaphore(
+            max(1, app_settings.server.registry_max_concurrency)
+        )
+    return _registry_semaphore
 
 
 class RegctlError(Exception):
@@ -108,23 +116,25 @@ async def _negative_cache_add(repo_tag: str) -> None:
         logger.warning('Error writing regctl negative cache for %s', repo_tag, exc_info=True)
 
 
-async def _run_regctl(cmd: str) -> bytes:
+async def _run_regctl(args: list[str]) -> bytes:
     """Run a regctl command under the global concurrency limiter, retrying
     rate-limit/transient failures with exponential backoff and jitter.
 
-    Returns the command's stdout on success. Raises RegctlNotFoundError for a
-    definitive not-found result, or RegctlError otherwise.
+    Arguments are passed as a list and executed without a shell to avoid any
+    command injection from image tags. Returns the command's stdout on success.
+    Raises RegctlNotFoundError for a definitive not-found result, or RegctlError
+    otherwise.
     """
     max_retries = max(0, app_settings.server.registry_max_retries)
-    base_backoff = app_settings.server.registry_retry_backoff_seconds
+    base_backoff = max(0.0, app_settings.server.registry_retry_backoff_seconds)
     last_error = ''
 
     for attempt in range(max_retries + 1):
         # Only hold a concurrency slot while the subprocess is actually running;
         # release it before backing off so other calls can make progress.
-        async with _registry_semaphore:
-            process = await asyncio.create_subprocess_shell(
-                cmd=cmd,
+        async with _get_registry_semaphore():
+            process = await asyncio.create_subprocess_exec(
+                *args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -133,7 +143,7 @@ async def _run_regctl(cmd: str) -> bytes:
             if process.returncode == 0:
                 return stdout
 
-            last_error = stderr.decode().strip()
+            last_error = stderr.decode('utf-8', errors='replace').strip()
 
         if attempt < max_retries and _is_retryable_error(last_error):
             wait = min(base_backoff * (2 ** attempt), _MAX_BACKOFF_SECONDS)
@@ -171,9 +181,8 @@ async def get_image_remote_digest(repo_tag: str, reraise: bool = False, no_cache
                 logger.debug('regctl image digest skipped (negative cache): %s', repo_tag)
                 return None
 
-            cmd = f'regctl image digest "{repo_tag}"'
             logger.debug('regctl image digest request: %s', repo_tag)
-            stdout = await _run_regctl(cmd)
+            stdout = await _run_regctl(['regctl', 'image', 'digest', repo_tag])
 
             digest = stdout.decode().strip()
             res = f'{image_name}@{digest}'
@@ -214,9 +223,8 @@ async def get_image_inspect(repo_tag: str, reraise: bool = False, no_cache: bool
                 logger.debug('regctl image inspect skipped (negative cache): %s', repo_tag)
                 return None
 
-            cmd = f'regctl image inspect "{repo_tag}"'
             logger.debug('regctl image inspect request: %s', repo_tag)
-            stdout = await _run_regctl(cmd)
+            stdout = await _run_regctl(['regctl', 'image', 'inspect', repo_tag])
 
             res = RegctlImageInspect.model_validate_json(stdout)
             logger.info('regctl image inspect response: %s', res.created)
